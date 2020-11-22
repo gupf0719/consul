@@ -35,7 +35,7 @@ spec:
         fsGroup: 1000
       containers:
         - name: consul
-          image: 172.32.150.15/prometheus/consul
+          image: consul
           env:
             - name: POD_IP
               valueFrom:
