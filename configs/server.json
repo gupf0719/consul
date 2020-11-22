@@ -1,0 +1,27 @@
+{
+    "skip_leave_on_interrupt": true,
+    "disable_host_node_id": false,
+    "leave_on_terminate" : false,
+    "client_addr": "0.0.0.0",
+    "datacenter": "dc1",
+    "bind_addr": "0.0.0.0",
+    "ca_file": "/etc/tls/ca.pem",
+    "cert_file": "/etc/tls/consul.pem",
+    "data_dir": "/consul/data",
+    "domain": "cluster.local",
+    "key_file": "/etc/tls/consul-key.pem",
+    "retry_join": [
+      "provider=k8s namespace=manage label_selector=\"app=consul,component=server\""
+    ],
+    "ports": {
+      "https": 8443
+    },
+    "server": true,
+    "telemetry": {
+      "prometheus_retention_time": "5m"
+    },
+    "verify_incoming": true,
+    "verify_outgoing": true,
+    "verify_server_hostname": true,
+    "ui": true
+}
