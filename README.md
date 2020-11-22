@@ -1,5 +1,4 @@
 ###consul部署
-@(文档)[顾鹏飞,gupf0719@gmail.com]
 
 > **生成 TLS Certificates**
 
