@@ -18,7 +18,7 @@ kind: PersistentVolume
 metadata:
   namespace: manage
   labels:
-    app: data-consul-0
+    app: consul-0
   name: data-consul-0
 spec:
   capacity:
@@ -51,7 +51,7 @@ kind: PersistentVolume
 metadata:
   namespace: manage
   labels:
-    app: data-consul-1
+    app: consul-1
   name: data-consul-1
 spec:
   capacity:
@@ -84,7 +84,7 @@ kind: PersistentVolume
 metadata:
   namespace: manage
   labels:
-    app: data-consul-2
+    app: consul-2
   name: data-consul-2
 spec:
   capacity:
