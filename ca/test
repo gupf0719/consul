@@ -1,0 +1,541 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"time"
+
+	"github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/client/transport"
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/option"
+)
+
+// MCPManager handles MCP server connections and tool management
+type MCPManager struct {
+	client     *client.Client
+	tools      []mcp.Tool
+	serverInfo *mcp.InitializeResult
+}
+
+// NewMCPManager creates a new MCP manager
+func NewMCPManager() *MCPManager {
+	return &MCPManager{
+		tools: []mcp.Tool{},
+	}
+}
+
+// ConnectStdio connects to MCP server using stdio transport
+func (m *MCPManager) ConnectStdio(ctx context.Context, command string, args ...string) error {
+	// Create stdio transport
+	stdioTransport := transport.NewStdio(command, nil, args...)
+
+	// Create client with the transport
+	m.client = client.NewClient(stdioTransport)
+
+	// Start the client
+	if err := m.client.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start MCP client: %w", err)
+	}
+
+	return m.initialize(ctx)
+}
+
+// ConnectHTTP connects to MCP server via HTTP
+func (m *MCPManager) ConnectHTTP(ctx context.Context, url string) error {
+	// Create HTTP transport
+	httpTransport, err := transport.NewStreamableHTTP(url)
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP transport: %w", err)
+	}
+
+	// Create client with the transport
+	m.client = client.NewClient(httpTransport)
+
+	// Start the client
+	if err := m.client.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start MCP client: %w", err)
+	}
+
+	return m.initialize(ctx)
+}
+
+// initialize the MCP client and loads tools
+func (m *MCPManager) initialize(ctx context.Context) error {
+	// Initialize the client
+	initRequest := mcp.InitializeRequest{}
+	initRequest.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+	initRequest.Params.ClientInfo = mcp.Implementation{
+		Name:    "mcp-manager",
+		Version: "1.0.0",
+	}
+	initRequest.Params.Capabilities = mcp.ClientCapabilities{}
+
+	serverInfo, err := m.client.Initialize(ctx, initRequest)
+	if err != nil {
+		return fmt.Errorf("failed to initialize MCP client: %w", err)
+	}
+
+	m.serverInfo = serverInfo
+	log.Printf("Connected to MCP server: %s (version %s)",
+		serverInfo.ServerInfo.Name,
+		serverInfo.ServerInfo.Version)
+
+	// Get available tools if supported
+	if serverInfo.Capabilities.Tools != nil {
+		if err := m.loadTools(ctx); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// loadTools loads available tools from the MCP server
+func (m *MCPManager) loadTools(ctx context.Context) error {
+	toolsRequest := mcp.ListToolsRequest{}
+	toolsResult, err := m.client.ListTools(ctx, toolsRequest)
+	if err != nil {
+		return fmt.Errorf("failed to list tools: %w", err)
+	}
+
+	m.tools = toolsResult.Tools
+	log.Printf("Loaded %d tools", len(m.tools))
+
+	for _, tool := range m.tools {
+		log.Printf("Tool: %s - %s", tool.Name, tool.Description)
+	}
+
+	return nil
+}
+
+// GetTools returns available tools
+func (m *MCPManager) GetTools() []mcp.Tool {
+	return m.tools
+}
+
+// GetToolByName gets tool by name
+func (m *MCPManager) GetToolByName(name string) (*mcp.Tool, bool) {
+	for _, tool := range m.tools {
+		if tool.Name == name {
+			return &tool, true
+		}
+	}
+	return nil, false
+}
+
+// CallTool calls a specific MCP tool
+func (m *MCPManager) CallTool(ctx context.Context, toolName string, arguments map[string]interface{}) (string, error) {
+	// Validate tool exists
+	_, exists := m.GetToolByName(toolName)
+	if !exists {
+		return "", fmt.Errorf("tool %s not found", toolName)
+	}
+
+	request := mcp.CallToolRequest{}
+	request.Params.Name = toolName
+	request.Params.Arguments = arguments
+
+	result, err := m.client.CallTool(ctx, request)
+	if err != nil {
+		return "", fmt.Errorf("failed to call MCP tool %s: %w", toolName, err)
+	}
+
+	// Process tool result
+	var resultStr string
+	if len(result.Content) > 0 {
+		// Assume result is text content
+		for _, content := range result.Content {
+			if textContent, ok := content.(*mcp.TextContent); ok {
+				resultStr += textContent.Text
+			}
+		}
+	}
+
+	if resultStr == "" {
+		// If no text content, serialize the entire result
+		resultBytes, err := json.Marshal(result)
+		if err != nil {
+			return "", fmt.Errorf("failed to marshal tool result: %w", err)
+		}
+		resultStr = string(resultBytes)
+	}
+
+	return resultStr, nil
+}
+
+// GetServerInfo returns server information
+func (m *MCPManager) GetServerInfo() *mcp.InitializeResult {
+	return m.serverInfo
+}
+
+// Close closes the MCP client connection
+func (m *MCPManager) Close() error {
+	if m.client != nil {
+		m.client.Close()
+	}
+	return nil
+}
+
+// OpenAIManager handles OpenAI client operations
+type OpenAIManager struct {
+	client *openai.Client
+}
+
+// NewOpenAIManager creates a new OpenAI manager
+func NewOpenAIManager(apiKey string) *OpenAIManager {
+	openaiClient := openai.NewClient(option.WithAPIKey(apiKey))
+	return &OpenAIManager{
+		client: openaiClient,
+	}
+}
+
+// ChatCompletion executes chat completion
+func (o *OpenAIManager) ChatCompletion(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion, tools []openai.ChatCompletionToolParam) (*openai.ChatCompletion, error) {
+	// Prepare request
+	params := openai.ChatCompletionNewParams{
+		Model:    openai.ChatModelGPT4o,
+		Messages: messages,
+	}
+
+	// Add tool definitions if available
+	if len(tools) > 0 {
+		params.Tools = tools
+		params.ToolChoice = openai.String("auto")
+	}
+
+	// Call OpenAI API
+	resp, err := o.client.Chat.Completions.New(ctx, params)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create chat completion: %w", err)
+	}
+
+	return resp, nil
+}
+
+// StreamChatCompletion streams chat completion
+func (o *OpenAIManager) StreamChatCompletion(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion, tools []openai.ChatCompletionToolParam) (*openai.ChatCompletionStream, error) {
+	params := openai.ChatCompletionNewParams{
+		Model:    openai.ChatModelGPT4o,
+		Messages: messages,
+		Stream:   openai.Bool(true),
+	}
+
+	// Add tool definitions if available
+	if len(tools) > 0 {
+		params.Tools = tools
+		params.ToolChoice = openai.String("auto")
+	}
+
+	stream := o.client.Chat.Completions.NewStreaming(ctx, params)
+	return stream, nil
+}
+
+// ToolConverter handles conversion between MCP tools and OpenAI tools
+type ToolConverter struct{}
+
+// NewToolConverter creates a new tool converter
+func NewToolConverter() *ToolConverter {
+	return &ToolConverter{}
+}
+
+// ConvertMCPToolsToOpenAI converts MCP tools to OpenAI tool format
+func (tc *ToolConverter) ConvertMCPToolsToOpenAI(mcpTools []mcp.Tool) []openai.ChatCompletionToolParam {
+	var openaiTools []openai.ChatCompletionToolParam
+
+	for _, mcpTool := range mcpTools {
+		// Convert parameter format
+		properties := make(map[string]interface{})
+		required := []string{}
+
+		if mcpTool.InputSchema != (mcp.ToolInputSchema{}) {
+			// Handle JSON Schema - convert to map for processing
+			schemaBytes, err := json.Marshal(mcpTool.InputSchema)
+			if err == nil {
+				var schemaMap map[string]interface{}
+				if json.Unmarshal(schemaBytes, &schemaMap) == nil {
+					if props, ok := schemaMap["properties"].(map[string]interface{}); ok {
+						properties = props
+					}
+					if req, ok := schemaMap["required"].([]interface{}); ok {
+						for _, r := range req {
+							if s, ok := r.(string); ok {
+								required = append(required, s)
+							}
+						}
+					}
+				}
+			}
+		}
+
+		openaiTool := openai.ChatCompletionToolParam{
+			Function: openai.FunctionDefinitionParam{
+				Name:        mcpTool.Name,
+				Description: openai.String(mcpTool.Description),
+				Parameters: openai.FunctionParameters{
+					"type":       "object",
+					"properties": properties,
+					"required":   required,
+				},
+			},
+		}
+
+		openaiTools = append(openaiTools, openaiTool)
+	}
+
+	return openaiTools
+}
+
+// ChatOrchestrator orchestrates chat completions with MCP tool support
+type ChatOrchestrator struct {
+	mcpManager    *MCPManager
+	openaiManager *OpenAIManager
+	toolConverter *ToolConverter
+}
+
+// NewChatOrchestrator creates a new chat orchestrator
+func NewChatOrchestrator(mcpManager *MCPManager, openaiManager *OpenAIManager) *ChatOrchestrator {
+	return &ChatOrchestrator{
+		mcpManager:    mcpManager,
+		openaiManager: openaiManager,
+		toolConverter: NewToolConverter(),
+	}
+}
+
+// ChatCompletion executes chat completion with tool support
+func (co *ChatOrchestrator) ChatCompletion(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion) (*openai.ChatCompletion, error) {
+	// Convert MCP tools to OpenAI format
+	mcpTools := co.mcpManager.GetTools()
+	openaiTools := co.toolConverter.ConvertMCPToolsToOpenAI(mcpTools)
+
+	// Get initial response
+	resp, err := co.openaiManager.ChatCompletion(ctx, messages, openaiTools)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check for tool calls
+	if len(resp.Choices) > 0 && len(resp.Choices[0].Message.ToolCalls) > 0 {
+		return co.handleToolCalls(ctx, messages, resp)
+	}
+
+	return resp, nil
+}
+
+// handleToolCalls handles tool calls and gets final response
+func (co *ChatOrchestrator) handleToolCalls(ctx context.Context, originalMessages []openai.ChatCompletionMessageParamUnion, resp *openai.ChatCompletion) (*openai.ChatCompletion, error) {
+	// Add assistant message with tool calls - use ToParam() method
+	newMessages := append(originalMessages, resp.Choices[0].Message.ToParam())
+
+	// Execute each tool call
+	for _, toolCall := range resp.Choices[0].Message.ToolCalls {
+		// Parse tool arguments
+		var arguments map[string]interface{}
+		err := json.Unmarshal([]byte(toolCall.Function.Arguments), &arguments)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse tool arguments: %w", err)
+		}
+
+		// Call MCP tool
+		toolResult, err := co.mcpManager.CallTool(ctx, toolCall.Function.Name, arguments)
+		if err != nil {
+			toolResult = fmt.Sprintf("Error calling tool: %s", err.Error())
+		}
+
+		// Add tool call result to message using ToolMessage helper
+		toolMessage := openai.ToolMessage(toolResult, toolCall.ID)
+		newMessages = append(newMessages, toolMessage)
+	}
+
+	// Get final response without tools (to avoid infinite loop)
+	return co.openaiManager.ChatCompletion(ctx, newMessages, nil)
+}
+
+// StreamChatCompletion streams chat completion
+func (co *ChatOrchestrator) StreamChatCompletion(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion) (*openai.ChatCompletionStream, error) {
+	// Convert MCP tools to OpenAI format
+	mcpTools := co.mcpManager.GetTools()
+	openaiTools := co.toolConverter.ConvertMCPToolsToOpenAI(mcpTools)
+
+	return co.openaiManager.StreamChatCompletion(ctx, messages, openaiTools)
+}
+
+// AssistantSession represents a conversation session
+type AssistantSession struct {
+	orchestrator *ChatOrchestrator
+	messages     []openai.ChatCompletionMessageParamUnion
+	systemPrompt string
+}
+
+// NewAssistantSession creates a new assistant session
+func NewAssistantSession(orchestrator *ChatOrchestrator, systemPrompt string) *AssistantSession {
+	return &AssistantSession{
+		orchestrator: orchestrator,
+		messages:     []openai.ChatCompletionMessageParamUnion{},
+		systemPrompt: systemPrompt,
+	}
+}
+
+// SendMessage sends a message and gets response
+func (s *AssistantSession) SendMessage(ctx context.Context, userMessage string) (string, error) {
+	// Prepare messages
+	var messages []openai.ChatCompletionMessageParamUnion
+
+	// Add system prompt
+	if s.systemPrompt != "" {
+		messages = append(messages, openai.SystemMessage(s.systemPrompt))
+	}
+
+	// Add history messages
+	messages = append(messages, s.messages...)
+
+	// Add user message
+	messages = append(messages, openai.UserMessage(userMessage))
+
+	// Get response
+	resp, err := s.orchestrator.ChatCompletion(ctx, messages)
+	if err != nil {
+		return "", err
+	}
+
+	if len(resp.Choices) == 0 {
+		return "", fmt.Errorf("no response from assistant")
+	}
+
+	assistantResponse := resp.Choices[0].Message.Content
+
+	// Update session history
+	s.AddMessage("user", userMessage)
+	s.AddMessage("assistant", assistantResponse)
+
+	return assistantResponse, nil
+}
+
+// AddMessage adds a message to session history
+func (s *AssistantSession) AddMessage(role string, content string) {
+	switch role {
+	case "user":
+		s.messages = append(s.messages, openai.UserMessage(content))
+	case "assistant":
+		s.messages = append(s.messages, openai.AssistantMessage(content))
+	case "system":
+		s.messages = append(s.messages, openai.SystemMessage(content))
+	}
+}
+
+// GetConversationHistory gets conversation history
+func (s *AssistantSession) GetConversationHistory() []openai.ChatCompletionMessageParamUnion {
+	return s.messages
+}
+
+// ClearHistory clears conversation history
+func (s *AssistantSession) ClearHistory() {
+	s.messages = []openai.ChatCompletionMessageParamUnion{}
+}
+
+// Example usage following the demo pattern
+func main() {
+	// Get OpenAI API key from environment variable
+	openaiAPIKey := os.Getenv("OPENAI_API_KEY")
+	if openaiAPIKey == "" {
+		log.Fatal("OPENAI_API_KEY environment variable is required")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Create MCP manager
+	mcpManager := NewMCPManager()
+	defer mcpManager.Close()
+
+	// Connect to MCP server
+	err := mcpManager.ConnectStdio(ctx, "npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp")
+	if err != nil {
+		log.Printf("Warning: Failed to connect to MCP server: %v", err)
+		log.Println("Continuing without MCP tools...")
+	}
+
+	// Create OpenAI manager
+	openaiManager := NewOpenAIManager(openaiAPIKey)
+
+	// Create chat orchestrator
+	orchestrator := NewChatOrchestrator(mcpManager, openaiManager)
+
+	// Example following the demo pattern
+	fmt.Println("=== Chat Completion with Tool Calling (Demo Pattern) ===")
+
+	question := "Can you read a file from /tmp directory and tell me what's in it?"
+	fmt.Print("> ")
+	fmt.Println(question)
+
+	// Initial messages
+	messages := []openai.ChatCompletionMessageParamUnion{
+		openai.UserMessage(question),
+	}
+
+	// Get MCP tools and convert to OpenAI format
+	mcpTools := mcpManager.GetTools()
+	openaiTools := orchestrator.toolConverter.ConvertMCPToolsToOpenAI(mcpTools)
+
+	// Make initial chat completion request
+	completion, err := openaiManager.ChatCompletion(ctx, messages, openaiTools)
+	if err != nil {
+		panic(err)
+	}
+
+	toolCalls := completion.Choices[0].Message.ToolCalls
+
+	// Return early if there are no tool calls
+	if len(toolCalls) == 0 {
+		fmt.Printf("Assistant: %s\n", completion.Choices[0].Message.Content)
+		return
+	}
+
+	// If there was a function call, continue the conversation
+	messages = append(messages, completion.Choices[0].Message.ToParam())
+
+	for _, toolCall := range toolCalls {
+		fmt.Printf("Calling tool: %s\n", toolCall.Function.Name)
+
+		// Extract arguments from the function call
+		var args map[string]interface{}
+		err := json.Unmarshal([]byte(toolCall.Function.Arguments), &args)
+		if err != nil {
+			panic(err)
+		}
+
+		// Call MCP tool
+		toolResult, err := mcpManager.CallTool(ctx, toolCall.Function.Name, args)
+		if err != nil {
+			toolResult = fmt.Sprintf("Error calling tool: %s", err.Error())
+		}
+
+		fmt.Printf("Tool result: %s\n", toolResult)
+
+		// Add tool message to conversation
+		messages = append(messages, openai.ToolMessage(toolResult, toolCall.ID))
+	}
+
+	// Get final completion
+	completion, err = openaiManager.ChatCompletion(ctx, messages, nil)
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Printf("Assistant: %s\n", completion.Choices[0].Message.Content)
+
+	// Example 2: Assistant session
+	fmt.Println("\n=== Assistant Session ===")
+	session := NewAssistantSession(orchestrator, "You are a helpful assistant with access to filesystem tools.")
+
+	response, err := session.SendMessage(ctx, "What tools do you have available?")
+	if err != nil {
+		log.Printf("Session error: %v", err)
+	} else {
+		fmt.Printf("Session Assistant: %s\n", response)
+	}
+}
