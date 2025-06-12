@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/openai/openai-go/packages/ssestream"
 	"log"
 	"os"
 	"time"
@@ -190,7 +191,7 @@ type OpenAIManager struct {
 func NewOpenAIManager(apiKey string) *OpenAIManager {
 	openaiClient := openai.NewClient(option.WithAPIKey(apiKey))
 	return &OpenAIManager{
-		client: openaiClient,
+		client: &openaiClient,
 	}
 }
 
@@ -205,7 +206,7 @@ func (o *OpenAIManager) ChatCompletion(ctx context.Context, messages []openai.Ch
 	// Add tool definitions if available
 	if len(tools) > 0 {
 		params.Tools = tools
-		params.ToolChoice = openai.String("auto")
+		params.ToolChoice = openai.ChatCompletionToolChoiceOptionUnionParam{OfAuto: openai.String("auto")}
 	}
 
 	// Call OpenAI API
@@ -218,17 +219,19 @@ func (o *OpenAIManager) ChatCompletion(ctx context.Context, messages []openai.Ch
 }
 
 // StreamChatCompletion streams chat completion
-func (o *OpenAIManager) StreamChatCompletion(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion, tools []openai.ChatCompletionToolParam) (*openai.ChatCompletionStream, error) {
+func (o *OpenAIManager) StreamChatCompletion(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion, tools []openai.ChatCompletionToolParam) (*ssestream.Stream[openai.ChatCompletionChunk], error) {
 	params := openai.ChatCompletionNewParams{
 		Model:    openai.ChatModelGPT4o,
 		Messages: messages,
-		Stream:   openai.Bool(true),
+		StreamOptions: openai.ChatCompletionStreamOptionsParam{
+			IncludeUsage: openai.Bool(true),
+		},
 	}
 
 	// Add tool definitions if available
 	if len(tools) > 0 {
 		params.Tools = tools
-		params.ToolChoice = openai.String("auto")
+		params.ToolChoice = openai.ChatCompletionToolChoiceOptionUnionParam{OfAuto: openai.String("auto")}
 	}
 
 	stream := o.client.Chat.Completions.NewStreaming(ctx, params)
@@ -250,9 +253,9 @@ func (tc *ToolConverter) ConvertMCPToolsToOpenAI(mcpTools []mcp.Tool) []openai.C
 	for _, mcpTool := range mcpTools {
 		// Convert parameter format
 		properties := make(map[string]interface{})
-		required := []string{}
+		var required []string
 
-		if mcpTool.InputSchema != (mcp.ToolInputSchema{}) {
+		if mcpTool.InputSchema.Properties != nil {
 			// Handle JSON Schema - convert to map for processing
 			schemaBytes, err := json.Marshal(mcpTool.InputSchema)
 			if err == nil {
@@ -356,7 +359,7 @@ func (co *ChatOrchestrator) handleToolCalls(ctx context.Context, originalMessage
 }
 
 // StreamChatCompletion streams chat completion
-func (co *ChatOrchestrator) StreamChatCompletion(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion) (*openai.ChatCompletionStream, error) {
+func (co *ChatOrchestrator) StreamChatCompletion(ctx context.Context, messages []openai.ChatCompletionMessageParamUnion) (*ssestream.Stream[openai.ChatCompletionChunk], error) {
 	// Convert MCP tools to OpenAI format
 	mcpTools := co.mcpManager.GetTools()
 	openaiTools := co.toolConverter.ConvertMCPToolsToOpenAI(mcpTools)
